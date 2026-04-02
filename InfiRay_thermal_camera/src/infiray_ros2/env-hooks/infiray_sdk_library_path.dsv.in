@@ -1,0 +1,1 @@
+append-non-duplicate;LD_LIBRARY_PATH;@INFIRAY_SDK_DIR@/libs
