@@ -1,0 +1,8 @@
+if [ -z "${LD_LIBRARY_PATH}" ]; then
+	export LD_LIBRARY_PATH="@INFIRAY_SDK_DIR@/libs"
+else
+	case ":${LD_LIBRARY_PATH}:" in
+		*:@INFIRAY_SDK_DIR@/libs:*) ;;
+		*) export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:@INFIRAY_SDK_DIR@/libs" ;;
+	esac
+fi
