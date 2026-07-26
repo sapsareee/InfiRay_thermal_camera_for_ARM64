@@ -48,20 +48,15 @@ sudo apt install -y \
 
 ## 저장소 받기
 
-Fieldscale는 Git 서브모듈로 연결되어 있으므로 처음부터 함께 받는 것이 좋습니다.
+Fieldscale 소스는 이 저장소의 `src/fieldscale`에 포함되어 있으므로 일반
+`git clone`만으로 함께 내려받을 수 있습니다.
 
 ```bash
 cd ~/dev/repos
-git clone --recurse-submodules \
+git clone \
   https://github.com/sapsareee/InfiRay_thermal_camera_for_ARM64.git \
   Infiray_ws
 cd Infiray_ws
-```
-
-이미 저장소를 clone했다면 다음 명령으로 Fieldscale를 받습니다.
-
-```bash
-git submodule update --init --recursive
 ```
 
 ## ARM64 SDK 배치
@@ -105,7 +100,6 @@ file "$INFIRAY_SDK_DIR/libs/libIRCNetSDK.so"
 
 ```bash
 cd ~/dev/repos/Infiray_ws
-git submodule update --init --recursive
 
 source /opt/ros/humble/setup.bash
 export INFIRAY_SDK_DIR=/home/hyuns/dev/sdks/infiray_sdk/SDK_NET_Linux_aarch64--glibc--stable-2022.08-1_V2.0.0.1/SDK
@@ -303,12 +297,6 @@ source ~/dev/repos/Infiray_ws/install/setup.bash
 ```
 
 `install/setup.bash`가 없다면 아직 빌드하지 않았거나 빌드에 실패한 것입니다.
-
-### Fieldscale 서브모듈 오류
-
-```bash
-git submodule update --init --recursive
-```
 
 ### SDK 파일을 찾지 못하는 CMake 오류
 
