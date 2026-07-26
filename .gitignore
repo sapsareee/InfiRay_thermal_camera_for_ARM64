@@ -3,6 +3,7 @@ build/
 install/
 log/
 **/__pycache__/
+IRCNETSDK.log
 
 # infiray_ros2 작업물 제외
 # src/infiray_ros2/

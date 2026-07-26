@@ -22,44 +22,13 @@
 #include "std_msgs/msg/bool.hpp"
 #include "cv_bridge/cv_bridge.h"
 #include "Fieldscale.h"
+#include "infiray_ros2/infiray_net_camera.hpp"
 
 using namespace std;
 
-// --- [윈도우 호환용 매크로 정의] ---
-#ifndef _WIN32
-    #define __stdcall
-    #define CALLINGCONVEN
-    #define CNET_APIIMPORT
-    #define CALLBACK
-    #define WINAPI
-    typedef unsigned long DWORD;
-    typedef unsigned short WORD;
-    typedef unsigned char BYTE;
-    typedef long LPARAM;
-    typedef unsigned long WPARAM;
-    typedef int BOOL;
-    typedef unsigned int UINT;
-    typedef void* HWND;
-    typedef void* HANDLE;
-    typedef void* HDC;
-    typedef unsigned int COLORREF;
-    typedef long LONG;
-    typedef struct _RECT { LONG left; LONG top; LONG right; LONG bottom; } RECT;
-    #ifndef TRUE
-        #define TRUE 1
-    #endif
-    #ifndef FALSE
-        #define FALSE 0
-    #endif
-#endif
-
-#include "LinuxDef.h"
-#include "InfraredTempSDK.h"
-
 enum class VideoSource : int
 {
-    SDK = 0,
-    DIRECT_RTSP = 1
+    SDK_NET = 0
 };
 
 // ---- 최신 프레임 버퍼 (영상용) ----
@@ -72,7 +41,7 @@ static int g_width = 0;
 static int g_height = 0;
 static bool g_hasNewFrame = false;
 static std::atomic<bool> g_running{true};
-static std::atomic<VideoSource> g_activeVideoSource{VideoSource::SDK};
+static std::atomic<VideoSource> g_activeVideoSource{VideoSource::SDK_NET};
 
 // SDK 입력 주기와 파이프라인 드롭을 확인하기 위한 누적 통계
 static uint64_t g_receivedFrames = 0;
@@ -91,18 +60,8 @@ static std::vector<uint16_t> g_tempBuf;
 
 static double rawToCelsius(double raw)
 {
-    double calcValue = raw;
-    double divisor = 10.0;
-
-    if (calcValue > 7300.0) {
-        calcValue = calcValue - 3300.0;
-        divisor = 15.0;
-    } else {
-        calcValue = calcValue + 7000.0;
-        divisor = 30.0;
-    }
-
-    return (calcValue / divisor) - 273.15;
+    // SDK_NET은 Kelvin x 10 형식의 uint16_t 온도 배열을 전달한다.
+    return (raw / 10.0) - 273.15;
 }
 
 struct TempTrendSample
@@ -113,7 +72,8 @@ struct TempTrendSample
 
 static const char* videoSourceName(VideoSource source)
 {
-    return source == VideoSource::DIRECT_RTSP ? "direct RTSP" : "SDK";
+    (void)source;
+    return "SDK_NET";
 }
 
 static void submitGrayFrame(
@@ -166,63 +126,21 @@ static void submitGrayFrame(
     g_cv.notify_one();
 }
 
-// ---- SDK 영상 콜백 (직접 RTSP 연결 실패 시 대체용) ----
-void videoCallBack(char *pBuffer, long BufferLen, int width, int height, void *pContext) {
-    const long expected = static_cast<long>(width) * static_cast<long>(height) * 3 / 2;
-    if (pBuffer == nullptr || width <= 0 || height <= 0 || BufferLen != expected) {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        ++g_rejectedFrames;
-        return;
-    }
+static void submitTemperatureFrame(
+    const uint16_t* temperatureData,
+    int width,
+    int height)
+{
+    if (temperatureData == nullptr || width <= 0 || height <= 0) return;
 
-    // SDK의 YUV420 버퍼에서 밝기(Y) 평면만 사용한다.
-    submitGrayFrame(
-        reinterpret_cast<const uint8_t*>(pBuffer),
-        static_cast<size_t>(width) * static_cast<size_t>(height),
-        width,
-        height,
-        VideoSource::SDK);
-}
-
-// CHyvStream을 직접 사용할 때는 SDK wrapper가 강제로 덮어쓰는 TCP 설정을
-// 피할 수 있다. VideoCallBack에는 길이가 없으므로 Y 평면 크기는 해상도로 계산한다.
-void directVideoCallBack(char *pBuffer, int width, int height, void *pContext) {
-    submitGrayFrame(
-        reinterpret_cast<const uint8_t*>(pBuffer),
-        static_cast<size_t>(width) * static_cast<size_t>(height),
-        width,
-        height,
-        VideoSource::DIRECT_RTSP);
-}
-
-void directTempCallBack(char *pBuffer, int bufferLen, void *pContext);
-
-// ---- 온도 데이터 콜백 ----
-void tempCallBack(char *pBuffer, long BufferLen, void* pContext) {
-    if (pBuffer == nullptr || BufferLen <= 0 || BufferLen % 2 != 0) return;
-    
-    int numPixels = BufferLen / 2; 
-    if (numPixels % 2 != 0) return;
-
-    // 변환은 콜백 전용 버퍼에서 수행하고, 완성된 데이터만 짧게 잠근 뒤 전달한다.
+    const size_t pixelCount =
+        static_cast<size_t>(width) * static_cast<size_t>(height);
     static thread_local std::vector<uint16_t> decodedTemp;
-    decodedTemp.resize(numPixels);
-    
-    uint8_t* temp_buffer = (uint8_t*)pBuffer;
-    for (int ii = 0; ii < numPixels / 2; ii++) {
-        decodedTemp[ii * 2]     = (uint16_t)((temp_buffer[ii * 2] << 8)     + temp_buffer[ii * 2 + 1 + numPixels]);
-        decodedTemp[ii * 2 + 1] = (uint16_t)((temp_buffer[ii * 2 + 1] << 8) + temp_buffer[ii * 2 + numPixels]);
-    }
-
+    decodedTemp.assign(temperatureData, temperatureData + pixelCount);
     {
         std::lock_guard<std::mutex> lk(g_tempMtx);
         g_tempBuf.swap(decodedTemp);
     }
-}
-
-void directTempCallBack(char *pBuffer, int bufferLen, void *pContext) {
-    // 벤더 SDK의 OtherCallBackFunc도 이 버퍼를 변환 없이 TempCallBack으로 전달한다.
-    tempCallBack(pBuffer, static_cast<long>(bufferLen), pContext);
 }
 
 int main(int argc, char** argv) {
@@ -239,7 +157,7 @@ int main(int argc, char** argv) {
     const std::string camera_password =
         node->declare_parameter<std::string>("camera_password", "admin");
     const int camera_port = static_cast<int>(
-        node->declare_parameter<int64_t>("camera_control_port", 3000));
+        node->declare_parameter<int64_t>("camera_control_port", 80));
     const int camera_image_fps = static_cast<int>(
         node->declare_parameter<int64_t>("camera_image_fps", 0));
     const double target_image_fps =
@@ -306,9 +224,7 @@ int main(int argc, char** argv) {
 
     std::cout << "Starting Thermal App (ROS2 Integrated)\n";
     std::cout << "Local Display Mode: " << (show_display ? "ON" : "OFF") << "\n";
-    std::cout << "Video Input: "
-              << (use_low_latency_rtsp ? "Direct vendor RTSP" : "SDK wrapper")
-              << "\n";
+    std::cout << "Video Input: SDK_NET grayscale preview\n";
     std::cout << "Fieldscale: " << (fieldscale_enabled ? "ON" : "OFF")
               << " (video=" << (fieldscale_video ? "ON" : "OFF")
               << ", clahe=" << (fieldscale_clahe ? "ON" : "OFF") << ")\n";
@@ -322,147 +238,73 @@ int main(int argc, char** argv) {
         fieldscale_clahe,
         fieldscale_video);
 
-    int deviceType = 1; 
-    std::vector<char> username(camera_username.begin(), camera_username.end());
-    std::vector<char> password(camera_password.begin(), camera_password.end());
-    username.push_back('\0');
-    password.push_back('\0');
-
-    ChannelInfo devInfo;
-    memset(&devInfo, 0, sizeof(ChannelInfo));
-    std::snprintf(devInfo.szUserName, sizeof(devInfo.szUserName), "%s", camera_username.c_str());
-    std::snprintf(devInfo.szPWD, sizeof(devInfo.szPWD), "%s", camera_password.c_str());
-    std::snprintf(devInfo.szIP, sizeof(devInfo.szIP), "%s", target_ip.c_str());
-    devInfo.wPortNum = camera_port;
-
-    IRNETHANDLE pHandle = nullptr;
-    bool sdkInitialized = false;
-    auto initializeFullSdk = [&]() -> bool {
-        if (sdkInitialized) return true;
-
-        sdk_set_type(deviceType, username.data(), password.data());
-        if (sdk_initialize() < 0) {
-            RCLCPP_ERROR(node->get_logger(), "SDK initialization failed");
-            return false;
-        }
-
-        sleep(1);
-        pHandle = sdk_create();
-        if (pHandle == nullptr || sdk_loginDevice(pHandle, devInfo) != 0) {
-            RCLCPP_ERROR(node->get_logger(), "SDK login failed");
-            sdk_release();
-            pHandle = nullptr;
-            return false;
-        }
-
-        sdkInitialized = true;
-        return true;
-    };
-
-    // 0은 카메라 설정을 건드리지 않는 안전한 기본값이다. 양수로 지정한 경우에만
-    // 제어 SDK로 설정한 뒤 완전히 해제하고, 스트림 라이브러리를 별도로 초기화한다.
-    if (camera_image_fps > 0) {
-        if (!initializeFullSdk()) {
-            rclcpp::shutdown();
-            return -1;
-        }
-
-        int originalImageFps = 0;
-        const int getFpsResult = sdk_get_image_framerate(pHandle, devInfo, &originalImageFps);
-        if (getFpsResult == 0) {
-            RCLCPP_INFO(node->get_logger(), "Camera source frame rate: %d Hz", originalImageFps);
-        } else {
-            RCLCPP_WARN(
-                node->get_logger(),
-                "Could not read camera source frame rate (%d)",
-                getFpsResult);
-        }
-
-        if (getFpsResult != 0 || camera_image_fps != originalImageFps) {
-            const int setFpsResult = sdk_set_image_framerate(pHandle, devInfo, camera_image_fps);
-            if (setFpsResult == 0) {
-                RCLCPP_INFO(
-                    node->get_logger(),
-                    "Camera source frame rate set to %d Hz",
-                    camera_image_fps);
-            } else {
-                RCLCPP_WARN(
-                    node->get_logger(),
-                    "Could not set camera source frame rate to %d Hz (%d); continuing",
-                    camera_image_fps,
-                    setFpsResult);
-            }
-        }
-
-        sdk_release();
-        sdkInitialized = false;
-        pHandle = nullptr;
-        // 일부 펌웨어는 영상 설정 적용 중 스트림 서비스를 재시작한다.
-        std::this_thread::sleep_for(std::chrono::seconds(3));
+    if (use_low_latency_rtsp || rtsp_transport != "udp") {
+        RCLCPP_WARN(
+            node->get_logger(),
+            "SDK_NET manages RTSP transport internally; use_low_latency_rtsp=%s "
+            "and rtsp_transport=%s are retained for parameter compatibility",
+            use_low_latency_rtsp ? "true" : "false",
+            rtsp_transport.c_str());
     }
 
-    CHyvStream* directStream = nullptr;
-    bool directSdkInitialized = false;
-    bool sdkStreamStarted = false;
-    bool streamStarted = false;
-    if (use_low_latency_rtsp) {
-        const std::string rtspUrl =
-            "rtsp://" + target_ip +
-            "/cam/realmonitor?channel=1&subtype=0";
-        CHyvStream::InitSdk();
-        directSdkInitialized = true;
-        directStream = CHyvStream::Create(camera_username, camera_password);
-        if (directStream != nullptr) {
-            const int transport = rtsp_transport == "udp" ? TRANS_UDP : TRANS_TCP;
-            directStream->SetTransType(transport);
-            directStream->SetDecvType(DECV_YUV);
-            directStream->SetVideoCallBack(directVideoCallBack, nullptr);
-            directStream->SetOtherCallBack(directTempCallBack, nullptr);
-            g_activeVideoSource.store(VideoSource::DIRECT_RTSP, std::memory_order_release);
+    infiray_ros2::InfirayNetCamera camera;
+    infiray_ros2::InfirayNetCamera::Config cameraConfig;
+    cameraConfig.ip = target_ip;
+    cameraConfig.port = camera_port;
+    cameraConfig.username = camera_username;
+    cameraConfig.password = camera_password;
+    cameraConfig.requested_frame_rate = camera_image_fps;
 
-            std::vector<char> mutableUrl(rtspUrl.begin(), rtspUrl.end());
-            mutableUrl.push_back('\0');
-            streamStarted = directStream->Start(mutableUrl.data());
-            if (streamStarted) {
-                RCLCPP_INFO(
-                    node->get_logger(),
-                    "Direct RTSP started: transport=%s, application frame queue=1",
-                    rtsp_transport.c_str());
-            } else {
-                directStream->Stop();
-                directStream->SetVideoCallBack(nullptr, nullptr);
-                directStream->SetOtherCallBack(nullptr, nullptr);
-                directStream->Release();
-                directStream = nullptr;
-                RCLCPP_WARN(node->get_logger(), "Direct RTSP start failed; falling back to SDK");
-            }
-        }
+    infiray_ros2::InfirayNetCamera::DeviceInfo cameraInfo;
+    std::string cameraError;
+    g_activeVideoSource.store(VideoSource::SDK_NET, std::memory_order_release);
+    if (!camera.start(
+            cameraConfig,
+            [](const uint8_t* frame, int width, int height) {
+                submitGrayFrame(
+                    frame,
+                    static_cast<size_t>(width) * static_cast<size_t>(height),
+                    width,
+                    height,
+                    VideoSource::SDK_NET);
+            },
+            [](const uint16_t* temperature, int width, int height, uint64_t) {
+                submitTemperatureFrame(temperature, width, height);
+            },
+            cameraInfo,
+            cameraError)) {
+        RCLCPP_ERROR(
+            node->get_logger(),
+            "Camera start failed: %s. Verify ability.csv/custom.csv are beside the executable.",
+            cameraError.c_str());
+        rclcpp::shutdown();
+        return -1;
     }
-
-    if (!streamStarted) {
-        if (directSdkInitialized) {
-            CHyvStream::UnInitSdk();
-            directSdkInitialized = false;
-        }
-        if (!initializeFullSdk()) {
-            rclcpp::shutdown();
-            return -1;
-        }
-
-        g_activeVideoSource.store(VideoSource::SDK, std::memory_order_release);
-        SetDeviceVideoCallBack(pHandle, videoCallBack, nullptr);
-        SetTempCallBack(pHandle, tempCallBack, nullptr);
-        if (sdk_start_url(pHandle, devInfo.szIP) != 0) {
-            std::cerr << "Stream Start Failed\n";
-            SetDeviceVideoCallBack(pHandle, nullptr, nullptr);
-            SetTempCallBack(pHandle, nullptr, nullptr);
-            sdk_release();
-            rclcpp::shutdown();
-            return -1;
-        }
-        sdkStreamStarted = true;
-        streamStarted = true;
-        RCLCPP_WARN(node->get_logger(), "Using SDK TCP video fallback");
+    RCLCPP_INFO(
+        node->get_logger(),
+        "SDK_NET camera connected: model=%d generation=%d IR channel=%d channels=%d",
+        cameraInfo.model,
+        cameraInfo.product_generation,
+        cameraInfo.infrared_channel,
+        cameraInfo.channel_count);
+    if (cameraInfo.get_frame_rate_result == IRC_NET_ERROR_OK) {
+        RCLCPP_INFO(
+            node->get_logger(),
+            "Camera source frame rate: %d Hz",
+            cameraInfo.frame_rate);
+    } else {
+        RCLCPP_WARN(
+            node->get_logger(),
+            "Could not read camera source frame rate (%d)",
+            cameraInfo.get_frame_rate_result);
+    }
+    if (camera_image_fps > 0 &&
+        cameraInfo.set_frame_rate_result != IRC_NET_ERROR_OK) {
+        RCLCPP_WARN(
+            node->get_logger(),
+            "Could not set camera source frame rate to %d Hz (%d); continuing",
+            camera_image_fps,
+            cameraInfo.set_frame_rate_result);
     }
 
     if (show_display) {
@@ -804,40 +646,9 @@ int main(int argc, char** argv) {
     g_running.store(false);
     g_cv.notify_all();
 
-    if (directStream != nullptr) {
-        // 새 콜백 진입을 막고 이미 실행 중인 콜백이 빠져나갈 시간을 준 뒤 Stop한다.
-        // SDK와 CHyvStream 전역을 동시에 초기화하지 않으므로 이 순서가 안전하다.
-        directStream->SetVideoCallBack(nullptr, nullptr);
-        directStream->SetOtherCallBack(nullptr, nullptr);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        directStream->Stop();
-        directStream->Release();
-        directStream = nullptr;
-    }
-
-    if (sdkStreamStarted) {
-        // 이 SDK는 sdk_stop_url() 안에서 CHyvStream을 해제한다. 따라서 콜백은
-        // 반드시 그 전에 해제해야 하며, 순서를 바꾸면 null 객체를 역참조한다.
-        SetDeviceVideoCallBack(pHandle, nullptr, nullptr);
-        SetTempCallBack(pHandle, nullptr, nullptr);
-        const int stopResult = sdk_stop_url(pHandle);
-        if (stopResult != 0) {
-            RCLCPP_WARN(node->get_logger(), "sdk_stop_url returned %d", stopResult);
-        }
-    }
-
-    // RTSP 종료는 비동기이므로 전역 자원을 해제하기 전에 drain한다.
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    if (directSdkInitialized) {
-        CHyvStream::UnInitSdk();
-        directSdkInitialized = false;
-    }
+    camera.stop();
     if (show_display) {
         cv::destroyAllWindows();
-    }
-    if (sdkInitialized) {
-        sdk_release();
-        sdkInitialized = false;
     }
     rclcpp::shutdown();
     std::cout << "Done.\n";
