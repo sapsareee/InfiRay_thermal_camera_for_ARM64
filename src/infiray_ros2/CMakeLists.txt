@@ -10,6 +10,7 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
+find_package(camera_info_manager REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui)
 find_package(Threads REQUIRED)
 
@@ -26,15 +27,31 @@ endif()
 set(INFIRAY_SDK_INCLUDE_DIR "${INFIRAY_SDK_DIR}/include")
 set(INFIRAY_SDK_LIBRARY_DIR "${INFIRAY_SDK_DIR}/libs")
 set(INFIRAY_SDK_LIBRARY "${INFIRAY_SDK_LIBRARY_DIR}/libIRCNetSDK.so")
+set(INFIRAY_SDK_RUNTIME_FILES
+  "${INFIRAY_SDK_DIR}/ability.csv"
+  "${INFIRAY_SDK_DIR}/custom.csv"
+)
 
 foreach(required_path
     "${INFIRAY_SDK_INCLUDE_DIR}/IRCNetSDK.h"
     "${INFIRAY_SDK_LIBRARY}"
-    "${INFIRAY_SDK_DIR}/ability.csv"
-    "${INFIRAY_SDK_DIR}/custom.csv")
+    ${INFIRAY_SDK_RUNTIME_FILES})
   if(NOT EXISTS "${required_path}")
     message(FATAL_ERROR "Required InfiRay SDK file not found: ${required_path}")
   endif()
+endforeach()
+
+# SDK_NET resolves its model/feature CSV files beside the real executable.
+# Normal installs place them in install/, while --symlink-install makes the
+# executable resolve to build/. Keep a copy in the build directory so both
+# layouts work with the same `colcon build` workflow.
+foreach(runtime_file IN LISTS INFIRAY_SDK_RUNTIME_FILES)
+  get_filename_component(runtime_filename "${runtime_file}" NAME)
+  configure_file(
+    "${runtime_file}"
+    "${CMAKE_CURRENT_BINARY_DIR}/${runtime_filename}"
+    COPYONLY
+  )
 endforeach()
 
 set(FIELDSCALE_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../fieldscale/cpp")
@@ -59,6 +76,11 @@ add_executable(
   src/infiray_fire_detect_raw16.cpp
   src/infiray_net_camera.cpp
 )
+add_executable(
+  thermal_calibration
+  src/thermal_calibration.cpp
+  src/infiray_net_camera.cpp
+)
 
 
 # InfiRay SDK_NET 헤더 및 Fieldscale C++ 헤더
@@ -70,6 +92,13 @@ target_include_directories(
 )
 target_include_directories(
   thermal_camera_fire_detect_raw16
+  PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${INFIRAY_SDK_INCLUDE_DIR}"
+    "${FIELDSCALE_CPP_DIR}"
+)
+target_include_directories(
+  thermal_calibration
   PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${INFIRAY_SDK_INCLUDE_DIR}"
@@ -90,6 +119,12 @@ ament_target_dependencies(
   sensor_msgs
   std_msgs
   cv_bridge
+)
+ament_target_dependencies(
+  thermal_calibration
+  rclcpp
+  sensor_msgs
+  camera_info_manager
 )
 
 # SDK_NET 본체만 직접 링크한다. SDK가 함께 제공한 OpenSSL/Poco/FFmpeg 등
@@ -120,20 +155,35 @@ foreach(target_name
   target_link_options(${target_name} PRIVATE "-Wl,--disable-new-dtags")
 endforeach()
 
+target_link_libraries(
+  thermal_calibration
+  Fieldscale
+  opencv_core
+  opencv_imgproc
+  "${INFIRAY_SDK_LIBRARY}"
+  Threads::Threads
+)
+set_target_properties(thermal_calibration PROPERTIES
+  BUILD_WITH_INSTALL_RPATH TRUE
+  BUILD_RPATH "${INFIRAY_RUNTIME_PATHS}"
+  INSTALL_RPATH "${INFIRAY_RUNTIME_PATHS}"
+)
+target_link_options(thermal_calibration PRIVATE "-Wl,--disable-new-dtags")
+
 target_link_libraries(thermal_camera_fire_detect_raw16 Fieldscale)
 
 install(
   TARGETS
     thermal_camera_fire_detect
     thermal_camera_fire_detect_raw16
+    thermal_calibration
   DESTINATION lib/${PROJECT_NAME}
 )
 
 # SDK_NET은 실행 파일의 디렉터리에서 모델/기능 매핑 CSV를 찾는다.
 install(
   FILES
-    "${INFIRAY_SDK_DIR}/ability.csv"
-    "${INFIRAY_SDK_DIR}/custom.csv"
+    ${INFIRAY_SDK_RUNTIME_FILES}
   DESTINATION lib/${PROJECT_NAME}
 )
 

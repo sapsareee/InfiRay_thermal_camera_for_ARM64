@@ -11,8 +11,9 @@
 | --- | ---: | --- |
 | `thermal_camera_fire_detect` | 10 Hz | 일반 열화상 표시와 화재 감지 |
 | `thermal_camera_fire_detect_raw16` | 30 Hz | Fieldscale 영상 처리가 추가된 노드 |
+| `thermal_calibration` | 30 Hz | 오버레이 없는 AT3003X mono8 영상과 CameraInfo |
 
-두 노드 모두 다음 기능을 제공합니다.
+화재 감지 노드 두 개는 다음 기능을 제공합니다.
 
 - SDK_NET을 통한 열화상 영상과 온도 프레임 수신
 - `/thermal/image` 영상 발행
@@ -41,9 +42,18 @@ sudo apt install -y \
   libopencv-dev \
   python3-colcon-common-extensions \
   ros-humble-cv-bridge \
+  ros-humble-camera-info-manager \
   ros-humble-rclcpp \
   ros-humble-sensor-msgs \
   ros-humble-std-msgs
+```
+
+실제 보정과 보정 영상 검증에는 다음 패키지도 필요합니다.
+
+```bash
+sudo apt install -y \
+  ros-humble-camera-calibration \
+  ros-humble-image-proc
 ```
 
 ## 저장소 받기
@@ -116,9 +126,10 @@ source install/setup.bash
 ros2 pkg executables infiray_ros2
 ```
 
-정상이면 다음 두 실행 파일이 표시됩니다.
+정상이면 다음 세 실행 파일이 표시됩니다.
 
 ```text
+infiray_ros2 thermal_calibration
 infiray_ros2 thermal_camera_fire_detect
 infiray_ros2 thermal_camera_fire_detect_raw16
 ```
@@ -200,6 +211,56 @@ Raw16 노드의 기본 발행률은 30 Hz이며 다음 Fieldscale 파라미터�
 | `fieldscale_gamma` | `1.5` |
 | `fieldscale_clahe` | `false` |
 | `fieldscale_video` | `true` |
+
+### AT3003X 기하 캘리브레이션 노드
+
+기존 화재 감지 노드를 먼저 종료한 뒤 실행합니다. 같은 카메라에 두 노드를
+동시에 연결하면 안 됩니다.
+
+```bash
+ros2 run infiray_ros2 thermal_calibration
+```
+
+이 노드는 리사이즈, 컬러맵, Fieldscale, 온도 분석, ROI와 문자 오버레이를
+적용하지 않은 SDK grayscale 프레임만 발행합니다. 실행 중에는 카메라 펌웨어의
+온도 OSD도 끄고, 종료할 때 이전 OSD 모드로 복원합니다.
+
+| 파라미터 | 기본값 |
+| --- | --- |
+| `camera_ip` | `192.168.1.123` |
+| `camera_username` | `admin` |
+| `camera_password` | `admin` |
+| `camera_control_port` | `80` |
+| `target_image_fps` | `30.0` |
+| `camera_info_url` | `file://${ROS_HOME}/camera_info/at3003x.yaml` |
+| `frame_id` | `thermal_optical_frame` |
+| `invert_image` | `false` |
+
+발행 인터페이스는 다음과 같습니다.
+
+```text
+/thermal/image_raw       sensor_msgs/msg/Image (mono8, 384x288)
+/thermal/camera_info     sensor_msgs/msg/CameraInfo
+/thermal/set_camera_info sensor_msgs/srv/SetCameraInfo
+```
+
+영상과 CameraInfo에는 같은 timestamp와 frame ID가 사용됩니다. 미보정 상태에도
+CameraInfo의 너비와 높이는 384×288로 발행되며 K, R, P는 0입니다.
+
+체커보드가 열화상에서 선명한지 확인한 다음 실제 내부 코너 수와 한 칸 크기를
+사용해 보정합니다. 다음 명령은 내부 코너 8×6, 한 칸 50 mm인 보드의 예입니다.
+
+```bash
+ros2 run camera_calibration cameracalibrator \
+  --size 8x6 \
+  --square 0.050 \
+  image:=/thermal/image_raw \
+  camera:=/thermal
+```
+
+계산 후 `COMMIT`을 누르면 `/thermal/set_camera_info`가 호출되고 기본 설정에서는
+`~/.ros/camera_info/at3003x.yaml`에 K, D, R, P가 저장됩니다. 다음 실행부터 같은
+파일을 자동으로 다시 읽습니다.
 
 프로그램은 `Ctrl+C`로 종료합니다. OpenCV 창이 활성화된 상태에서는 `Esc`로
 종료하고 숫자 `1`, `2`로 컬러/흑백 표시를 전환할 수 있습니다.

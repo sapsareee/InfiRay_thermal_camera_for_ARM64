@@ -108,6 +108,32 @@ bool InfirayNetCamera::start(
         }
     }
 
+    if (config.requested_osd_mode >= 0) {
+        device_info.get_osd_state_result =
+            IRC_NET_GetOSDState(handle_, &device_info.original_osd_mode);
+        if (device_info.get_osd_state_result != IRC_NET_ERROR_OK) {
+            error = sdkError(
+                "IRC_NET_GetOSDState",
+                device_info.get_osd_state_result);
+            cleanup();
+            return false;
+        }
+
+        original_osd_mode_ = device_info.original_osd_mode;
+        if (original_osd_mode_ != config.requested_osd_mode) {
+            device_info.set_osd_state_result =
+                IRC_NET_SetOSDState(handle_, config.requested_osd_mode);
+            if (device_info.set_osd_state_result != IRC_NET_ERROR_OK) {
+                error = sdkError(
+                    "IRC_NET_SetOSDState",
+                    device_info.set_osd_state_result);
+                cleanup();
+                return false;
+            }
+            osd_mode_changed_ = true;
+        }
+    }
+
     video_callback_ = std::move(video_callback);
     temperature_callback_ = std::move(temperature_callback);
     accept_callbacks_.store(true, std::memory_order_release);
@@ -215,6 +241,11 @@ void InfirayNetCamera::cleanup() noexcept
         IRC_NET_StopPreview(handle_);
         preview_started_ = false;
     }
+    if (osd_mode_changed_ && logged_in_) {
+        IRC_NET_SetOSDState(handle_, original_osd_mode_);
+        osd_mode_changed_ = false;
+    }
+    original_osd_mode_ = -1;
     if (logged_in_) {
         IRC_NET_Logout(handle_);
         logged_in_ = false;

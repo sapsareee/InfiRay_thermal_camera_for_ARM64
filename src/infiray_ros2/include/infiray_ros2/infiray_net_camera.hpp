@@ -21,6 +21,8 @@ public:
         std::string username;
         std::string password;
         int requested_frame_rate{0};
+        // Negative values leave the camera OSD mode unchanged.
+        int requested_osd_mode{-1};
     };
 
     struct DeviceInfo
@@ -33,6 +35,9 @@ public:
         int frame_rate{0};
         int get_frame_rate_result{IRC_NET_ERROR_FAILED};
         int set_frame_rate_result{IRC_NET_ERROR_OK};
+        int original_osd_mode{-1};
+        int get_osd_state_result{IRC_NET_ERROR_FAILED};
+        int set_osd_state_result{IRC_NET_ERROR_OK};
     };
 
     using VideoCallback =
@@ -80,6 +85,8 @@ private:
     bool logged_in_{false};
     bool preview_started_{false};
     bool temperature_started_{false};
+    bool osd_mode_changed_{false};
+    int original_osd_mode_{-1};
 };
 
 }  // namespace infiray_ros2
