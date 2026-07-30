@@ -221,9 +221,10 @@ Raw16 노드의 기본 발행률은 30 Hz이며 다음 Fieldscale 파라미터�
 ros2 run infiray_ros2 thermal_calibration
 ```
 
-이 노드는 리사이즈, 컬러맵, Fieldscale, 온도 분석, ROI와 문자 오버레이를
-적용하지 않은 SDK grayscale 프레임만 발행합니다. 실행 중에는 카메라 펌웨어의
-온도 OSD도 끄고, 종료할 때 이전 OSD 모드로 복원합니다.
+실행 시 기본 SDK grayscale 영상(모드 1)과 16비트 온도 프레임에 Fieldscale를
+적용한 영상(모드 2) 중 하나를 선택합니다. 두 모드 모두 리사이즈, 컬러맵,
+온도 분석, ROI와 문자 오버레이 없이 384×288 mono8로 발행합니다. 실행 중에는
+카메라 펌웨어의 온도 OSD도 끄고, 종료할 때 이전 OSD 모드로 복원합니다.
 
 | 파라미터 | 기본값 |
 | --- | --- |
@@ -235,6 +236,48 @@ ros2 run infiray_ros2 thermal_calibration
 | `camera_info_url` | `file://${ROS_HOME}/camera_info/at3003x.yaml` |
 | `frame_id` | `thermal_optical_frame` |
 | `invert_image` | `false` |
+| `image_mode` | `0`(터미널에서 1/2 선택) |
+| `fieldscale_preset` | `5`(1~10) |
+| `fieldscale_use_custom_settings` | `false` |
+
+Fieldscale 프리셋은 모드 2에서만 사용합니다.
+
+| 프리셋 | iterations | gamma | CLAHE |
+| --- | ---: | ---: | --- |
+| `1` | 5 | 1.00 | 끔 |
+| `2` | 5 | 1.02 | 끔 |
+| `3` | 5 | 1.04 | 끔 |
+| `4` | 6 | 1.06 | 끔 |
+| `5` | 6 | 1.08 | 끔 |
+| `6` | 6 | 1.10 | 켬 |
+| `7` | 6 | 1.12 | 켬 |
+| `8` | 7 | 1.14 | 켬 |
+| `9` | 7 | 1.17 | 켬 |
+| `10` | 7 | 1.20 | 켬 |
+
+모든 단계에서 `max_diff=400`, `min_diff=400`, `video=true`를 사용합니다.
+단계가 올라가면 감마 보정과 필드 전파가 증가하고, 6단계부터 CLAHE를
+사용해 국부 대비를 추가로 강화합니다.
+
+강한 프리셋을 바로 선택하려면 다음과 같이 실행합니다.
+
+```bash
+ros2 run infiray_ros2 thermal_calibration --ros-args \
+  -p image_mode:=2 \
+  -p fieldscale_preset:=10
+```
+
+`fieldscale_use_custom_settings:=true`일 때는 프리셋 대신 다음 세부
+파라미터가 적용됩니다.
+
+| 파라미터 | 기본값 |
+| --- | --- |
+| `fieldscale_max_diff` | `400.0` |
+| `fieldscale_min_diff` | `400.0` |
+| `fieldscale_iterations` | `7` |
+| `fieldscale_gamma` | `1.5` |
+| `fieldscale_clahe` | `false` |
+| `fieldscale_video` | `true` |
 
 발행 인터페이스는 다음과 같습니다.
 
@@ -248,14 +291,17 @@ ros2 run infiray_ros2 thermal_calibration
 CameraInfo의 너비와 높이는 384×288로 발행되며 K, R, P는 0입니다.
 
 체커보드가 열화상에서 선명한지 확인한 다음 실제 내부 코너 수와 한 칸 크기를
-사용해 보정합니다. 다음 명령은 내부 코너 8×6, 한 칸 50 mm인 보드의 예입니다.
+사용해 보정합니다. 다음 명령은 내부 코너 8×5, 한 칸 28.75 mm인 보드의
+예입니다.
 
 ```bash
 ros2 run camera_calibration cameracalibrator \
-  --size 8x6 \
-  --square 0.050 \
-  image:=/thermal/image_raw \
-  camera:=/thermal
+  --size 8x5 \
+  --square 0.02875 \
+  --disable_calib_cb_fast_check \
+  --ros-args \
+  -r image:=/thermal/image_raw \
+  -r camera:=/thermal
 ```
 
 계산 후 `COMMIT`을 누르면 `/thermal/set_camera_info`가 호출되고 기본 설정에서는

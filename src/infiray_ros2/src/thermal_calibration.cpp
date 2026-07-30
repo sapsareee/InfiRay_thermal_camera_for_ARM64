@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -83,6 +84,66 @@ const char* imageModeName(CalibrationImageMode mode)
            "Fieldscale-enhanced thermal";
 }
 
+struct FieldscaleSettings
+{
+    int preset_level{5};
+    bool custom{false};
+    double max_diff{400.0};
+    double min_diff{400.0};
+    int iterations{6};
+    double gamma{1.08};
+    bool clahe{false};
+    bool video{true};
+};
+
+FieldscaleSettings resolveFieldscaleSettings(
+    std::int64_t preset_level,
+    bool use_custom_settings,
+    double custom_max_diff,
+    double custom_min_diff,
+    int custom_iterations,
+    double custom_gamma,
+    bool custom_clahe,
+    bool custom_video)
+{
+    if (use_custom_settings) {
+        return {
+            static_cast<int>(preset_level),
+            true,
+            custom_max_diff,
+            custom_min_diff,
+            custom_iterations,
+            custom_gamma,
+            custom_clahe,
+            custom_video};
+    }
+
+    if (preset_level < 1 || preset_level > 10) {
+        throw std::invalid_argument(
+            "fieldscale_preset must be an integer from 1 to 10");
+    }
+
+    constexpr std::array<int, 10> kIterations{
+        5, 5, 5, 6, 6, 6, 6, 7, 7, 7};
+    constexpr std::array<double, 10> kGamma{
+        1.00, 1.02, 1.04, 1.06, 1.08,
+        1.10, 1.12, 1.14, 1.17, 1.20};
+    constexpr std::array<bool, 10> kClahe{
+        false, false, false, false, false,
+        true, true, true, true, true};
+    const auto index = static_cast<std::size_t>(preset_level - 1);
+
+    return {
+        static_cast<int>(preset_level),
+        false,
+        400.0,
+        400.0,
+        kIterations[index],
+        kGamma[index],
+        kClahe[index],
+        true};
+}
+
 sensor_msgs::msg::CameraInfo makeUncalibratedCameraInfo(
     std::uint32_t width,
     std::uint32_t height)
@@ -121,6 +182,11 @@ public:
         image_mode_ = selectCalibrationImageMode(
             declare_parameter<std::int64_t>("image_mode", 0));
 
+        const auto fieldscale_preset =
+            declare_parameter<std::int64_t>("fieldscale_preset", 5);
+        const auto fieldscale_use_custom_settings =
+            declare_parameter<bool>(
+                "fieldscale_use_custom_settings", false);
         const auto fieldscale_max_diff =
             declare_parameter<double>("fieldscale_max_diff", 400.0);
         const auto fieldscale_min_diff =
@@ -141,20 +207,55 @@ public:
             target_image_fps);
 
         if (image_mode_ == CalibrationImageMode::Fieldscale) {
-            if (fieldscale_max_diff < 0.0 || fieldscale_min_diff < 0.0 ||
-                fieldscale_iterations <= 0 || fieldscale_gamma <= 0.0) {
-                throw std::invalid_argument(
-                    "Fieldscale differences must be non-negative, and "
-                    "iterations and gamma must be positive");
-            }
-            cv::setNumThreads(1);
-            fieldscale_ = std::make_unique<Fieldscale>(
+            const auto settings = resolveFieldscaleSettings(
+                fieldscale_preset,
+                fieldscale_use_custom_settings,
                 fieldscale_max_diff,
                 fieldscale_min_diff,
                 fieldscale_iterations,
                 fieldscale_gamma,
                 fieldscale_clahe,
                 fieldscale_video);
+            if (settings.max_diff < 0.0 || settings.min_diff < 0.0 ||
+                settings.iterations <= 0 || settings.gamma <= 0.0) {
+                throw std::invalid_argument(
+                    "Fieldscale differences must be non-negative, and "
+                    "iterations and gamma must be positive");
+            }
+            cv::setNumThreads(1);
+            fieldscale_ = std::make_unique<Fieldscale>(
+                settings.max_diff,
+                settings.min_diff,
+                settings.iterations,
+                settings.gamma,
+                settings.clahe,
+                settings.video);
+            if (settings.custom) {
+                RCLCPP_INFO(
+                    get_logger(),
+                    "Fieldscale settings: custom "
+                    "(max_diff=%.1f, min_diff=%.1f, iterations=%d, "
+                    "gamma=%.2f, clahe=%s, video=%s)",
+                    settings.max_diff,
+                    settings.min_diff,
+                    settings.iterations,
+                    settings.gamma,
+                    settings.clahe ? "true" : "false",
+                    settings.video ? "true" : "false");
+            } else {
+                RCLCPP_INFO(
+                    get_logger(),
+                    "Fieldscale preset: %d/10 "
+                    "(max_diff=%.1f, min_diff=%.1f, iterations=%d, "
+                    "gamma=%.2f, clahe=%s, video=%s)",
+                    settings.preset_level,
+                    settings.max_diff,
+                    settings.min_diff,
+                    settings.iterations,
+                    settings.gamma,
+                    settings.clahe ? "true" : "false",
+                    settings.video ? "true" : "false");
+            }
         }
 
         camera_info_manager_ =
