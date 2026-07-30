@@ -9,6 +9,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(camera_info_manager REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui)
@@ -81,6 +82,11 @@ add_executable(
   src/thermal_calibration.cpp
   src/infiray_net_camera.cpp
 )
+add_executable(
+  thermal_slam
+  src/thermal_slam.cpp
+  src/infiray_net_camera.cpp
+)
 
 
 # InfiRay SDK_NET 헤더 및 Fieldscale C++ 헤더
@@ -99,6 +105,13 @@ target_include_directories(
 )
 target_include_directories(
   thermal_calibration
+  PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${INFIRAY_SDK_INCLUDE_DIR}"
+    "${FIELDSCALE_CPP_DIR}"
+)
+target_include_directories(
+  thermal_slam
   PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${INFIRAY_SDK_INCLUDE_DIR}"
@@ -124,6 +137,13 @@ ament_target_dependencies(
   thermal_calibration
   rclcpp
   sensor_msgs
+  camera_info_manager
+)
+ament_target_dependencies(
+  thermal_slam
+  rclcpp
+  sensor_msgs
+  std_srvs
   camera_info_manager
 )
 
@@ -172,11 +192,27 @@ target_link_options(thermal_calibration PRIVATE "-Wl,--disable-new-dtags")
 
 target_link_libraries(thermal_camera_fire_detect_raw16 Fieldscale)
 
+target_link_libraries(
+  thermal_slam
+  Fieldscale
+  opencv_core
+  opencv_imgproc
+  "${INFIRAY_SDK_LIBRARY}"
+  Threads::Threads
+)
+set_target_properties(thermal_slam PROPERTIES
+  BUILD_WITH_INSTALL_RPATH TRUE
+  BUILD_RPATH "${INFIRAY_RUNTIME_PATHS}"
+  INSTALL_RPATH "${INFIRAY_RUNTIME_PATHS}"
+)
+target_link_options(thermal_slam PRIVATE "-Wl,--disable-new-dtags")
+
 install(
   TARGETS
     thermal_camera_fire_detect
     thermal_camera_fire_detect_raw16
     thermal_calibration
+    thermal_slam
   DESTINATION lib/${PROJECT_NAME}
 )
 

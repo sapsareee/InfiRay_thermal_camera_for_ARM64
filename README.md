@@ -212,6 +212,90 @@ Raw16 노드의 기본 발행률은 30 Hz이며 다음 Fieldscale 파라미터�
 | `fieldscale_clahe` | `false` |
 | `fieldscale_video` | `true` |
 
+### ORB-SLAM3용 열화상 노드
+
+`thermal_slam`은 H.264 grayscale Preview를 사용하지 않고 SDK_NET의 픽셀별
+`uint16_t` radiometric 온도 프레임만 사용합니다. 최신 프레임 하나만 유지하여
+처리 지연이 누적되지 않게 하고 다음 영상을 함께 발행합니다.
+
+```text
+/thermal/image_slam        sensor_msgs/msg/Image (mono8)
+/thermal/image_radiometric sensor_msgs/msg/Image (mono16, Kelvin x 10)
+/thermal/camera_info       sensor_msgs/msg/CameraInfo
+```
+
+현재 SDK가 제공하는 `uint16_t` 값은 Kelvin × 10 온도 데이터이며 센서의
+RAW14 detector count로 확인된 데이터는 아닙니다. 카메라 AGC와 H.264 압축은
+이 경로에 적용되지 않습니다.
+
+기본 실행:
+
+```bash
+ros2 run infiray_ros2 thermal_slam
+```
+
+기본 `startup_percentile` tone mapping은 시작 후 2초간 온도 분포를 수집하고
+1%/99% 범위를 한 번 결정한 뒤 고정합니다. 이 동안 `image_radiometric`은
+발행하지만 `image_slam` 발행은 범위가 고정된 후 시작합니다. 프레임마다
+min/max를 다시 계산하지 않으므로 소프트웨어 AGC와 같은 밝기 출렁임을
+방지합니다.
+
+약한 Fieldscale 후처리는 기본적으로 꺼져 있습니다. 켜면 기존 고정 tone
+mapping 영상과 시간 평활된 Fieldscale 영상을 기본 85:15로 혼합하여 검정과
+흰색, 국부 경계를 살짝 강조합니다.
+
+```bash
+ros2 run infiray_ros2 thermal_slam --ros-args \
+  -p fieldscale_enabled:=true \
+  -p fieldscale_strength:=0.15
+```
+
+`fieldscale_strength`는 `0.0`이면 변화가 없고 `1.0`이면 Fieldscale 결과만
+사용합니다. ORB-SLAM3에서는 시간적 밝기 일관성을 위해 보통 `0.10`~`0.25`
+범위를 권장합니다.
+
+고정 온도 범위를 직접 지정:
+
+```bash
+ros2 run infiray_ros2 thermal_slam --ros-args \
+  -p tone_mapping_mode:=fixed \
+  -p fixed_min_temperature_c:=10.0 \
+  -p fixed_max_temperature_c:=50.0
+```
+
+주요 파라미터:
+
+| 파라미터 | 기본값 | 설명 |
+| --- | ---: | --- |
+| `tone_mapping_mode` | `startup_percentile` | `fixed` 또는 시작 구간에서 한 번 계산 후 고정 |
+| `startup_calibration_seconds` | `2.0` | 시작 tone mapping 수집 시간 |
+| `startup_low_percentile` | `0.01` | 고정할 하한 백분위 |
+| `startup_high_percentile` | `0.99` | 고정할 상한 백분위 |
+| `fixed_min_temperature_c` | `10.0` | 고정 모드 최저 온도 |
+| `fixed_max_temperature_c` | `50.0` | 고정 모드 최고 온도 |
+| `fieldscale_enabled` | `false` | 약한 Fieldscale 혼합 후처리 활성화 |
+| `fieldscale_strength` | `0.15` | 기본 mono8과 Fieldscale 결과의 혼합 비율, 0~1 |
+| `fieldscale_max_diff` | `400.0` | 국부 최대값 억제 임계값 |
+| `fieldscale_min_diff` | `400.0` | 국부 최소값 억제 임계값 |
+| `fieldscale_iterations` | `5` | Fieldscale 필드 전파 횟수 |
+| `fieldscale_gamma` | `1.0` | Fieldscale 감마, 1이면 추가 감마 변화 없음 |
+| `fieldscale_clahe` | `false` | Fieldscale 내부 CLAHE; SLAM에서는 기본 비활성화 권장 |
+| `fieldscale_video` | `true` | 프레임 간 Fieldscale 필드 시간 평활화 |
+| `unsharp_amount` | `0.7` | 시간 불변 경계 강조 강도, 0이면 비활성화 |
+| `clahe_enabled` | `false` | 선택적 CLAHE; 시간적 밝기 일관성을 먼저 비교할 것 |
+| `publish_radiometric` | `true` | 원본 mono16 온도 토픽 발행 |
+| `use_camera_timestamp` | `true` | SDK timestamp 간격을 ROS 시간축에 정렬 |
+| `drop_flat_frames` | `true` | NUC 셔터 또는 특징 없는 평탄 프레임을 SLAM에서 제외 |
+| `start_preview_for_sdk_compatibility` | `false` | 구형 펌웨어에서만 Preview를 함께 시작하되 영상은 무시 |
+
+자동 NUC 상태는 노드가 변경하지 않습니다. 활동 중 자동 셔터 중단이 필요하면
+카메라 UI에서 수동 셔터 모드로 전환한 다음 로봇이 정지했을 때 다음 서비스를
+호출합니다. 보정 중과 보정 직후의 프레임은 SLAM 토픽에서 제외합니다.
+
+```bash
+ros2 service call /thermal/manual_nuc std_srvs/srv/Trigger {}
+```
+
 ### AT3003X 기하 캘리브레이션 노드
 
 기존 화재 감지 노드를 먼저 종료한 뒤 실행합니다. 같은 카메라에 두 노드를

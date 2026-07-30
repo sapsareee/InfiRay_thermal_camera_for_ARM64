@@ -25,14 +25,12 @@ InfirayNetCamera::~InfirayNetCamera()
     stop();
 }
 
-bool InfirayNetCamera::start(
-    const Config& config,
-    VideoCallback video_callback,
-    TemperatureCallback temperature_callback,
-    DeviceInfo& device_info,
-    std::string& error)
+bool InfirayNetCamera::start(const Config& config, VideoCallback video_callback,
+                             TemperatureCallback temperature_callback,
+                             DeviceInfo& device_info, std::string& error)
 {
     stop();
+    std::lock_guard<std::mutex> control_lock(control_mutex_);
     error.clear();
     device_info = DeviceInfo{};
 
@@ -41,10 +39,17 @@ bool InfirayNetCamera::start(
         error = "invalid camera connection parameters";
         return false;
     }
-    if (!video_callback || !temperature_callback) {
-        error = "video and temperature callbacks are required";
+    if (!config.enable_preview && !config.enable_temperature) {
+        error = "at least one camera stream must be enabled";
         return false;
     }
+    if ((config.enable_preview && !video_callback) ||
+        (config.enable_temperature && !temperature_callback)) {
+        error = "callbacks are required for every enabled camera stream";
+        return false;
+    }
+    preview_enabled_ = config.enable_preview;
+    temperature_enabled_ = config.enable_temperature;
 
     int result = IRC_NET_Init();
     if (result != IRC_NET_ERROR_OK) {
@@ -54,18 +59,13 @@ bool InfirayNetCamera::start(
     sdk_initialized_ = true;
 
     IRC_NET_LOGIN_INFO login_info{};
-    std::snprintf(login_info.ip, sizeof(login_info.ip), "%s", config.ip.c_str());
+    std::snprintf(login_info.ip, sizeof(login_info.ip), "%s",
+                  config.ip.c_str());
     login_info.port = config.port;
-    std::snprintf(
-        login_info.username,
-        sizeof(login_info.username),
-        "%s",
-        config.username.c_str());
-    std::snprintf(
-        login_info.password,
-        sizeof(login_info.password),
-        "%s",
-        config.password.c_str());
+    std::snprintf(login_info.username, sizeof(login_info.username), "%s",
+                  config.username.c_str());
+    std::snprintf(login_info.password, sizeof(login_info.password), "%s",
+                  config.password.c_str());
 
     result = IRC_NET_Login(&login_info, &handle_);
     if (result != IRC_NET_ERROR_OK) {
@@ -112,9 +112,8 @@ bool InfirayNetCamera::start(
         device_info.get_osd_state_result =
             IRC_NET_GetOSDState(handle_, &device_info.original_osd_mode);
         if (device_info.get_osd_state_result != IRC_NET_ERROR_OK) {
-            error = sdkError(
-                "IRC_NET_GetOSDState",
-                device_info.get_osd_state_result);
+            error = sdkError("IRC_NET_GetOSDState",
+                             device_info.get_osd_state_result);
             cleanup();
             return false;
         }
@@ -124,9 +123,8 @@ bool InfirayNetCamera::start(
             device_info.set_osd_state_result =
                 IRC_NET_SetOSDState(handle_, config.requested_osd_mode);
             if (device_info.set_osd_state_result != IRC_NET_ERROR_OK) {
-                error = sdkError(
-                    "IRC_NET_SetOSDState",
-                    device_info.set_osd_state_result);
+                error = sdkError("IRC_NET_SetOSDState",
+                                 device_info.set_osd_state_result);
                 cleanup();
                 return false;
             }
@@ -138,52 +136,70 @@ bool InfirayNetCamera::start(
     temperature_callback_ = std::move(temperature_callback);
     accept_callbacks_.store(true, std::memory_order_release);
 
-    IRC_NET_PREVIEW_INFO preview_info{};
-    preview_info.channel = device_info.infrared_channel;
-    preview_info.streamType = IRC_NET_STREAM_MAIN;
-    preview_info.frameFmt = IRC_NET_FRAME_FMT_GRAY;
+    if (preview_enabled_) {
+        IRC_NET_PREVIEW_INFO preview_info{};
+        preview_info.channel = device_info.infrared_channel;
+        preview_info.streamType = IRC_NET_STREAM_MAIN;
+        preview_info.frameFmt = IRC_NET_FRAME_FMT_GRAY;
 
-    result = IRC_NET_StartPreview(
-        handle_,
-        &preview_info,
-        &InfirayNetCamera::videoCallbackBridge,
-        this);
-    if (result != IRC_NET_ERROR_OK) {
-        error = sdkError("IRC_NET_StartPreview", result);
-        cleanup();
-        return false;
+        result =
+            IRC_NET_StartPreview(handle_, &preview_info,
+                                 &InfirayNetCamera::videoCallbackBridge, this);
+        if (result != IRC_NET_ERROR_OK) {
+            error = sdkError("IRC_NET_StartPreview", result);
+            cleanup();
+            return false;
+        }
+        preview_started_ = true;
     }
-    preview_started_ = true;
 
-    result = IRC_NET_StartPullTemp_V2(
-        handle_,
-        &InfirayNetCamera::temperatureCallbackBridge,
-        this);
-    if (result != IRC_NET_ERROR_OK) {
-        error = sdkError("IRC_NET_StartPullTemp_V2", result);
-        cleanup();
-        return false;
+    if (temperature_enabled_) {
+        result = IRC_NET_StartPullTemp_V2(
+            handle_, &InfirayNetCamera::temperatureCallbackBridge, this);
+        if (result != IRC_NET_ERROR_OK) {
+            error = sdkError("IRC_NET_StartPullTemp_V2", result);
+            cleanup();
+            return false;
+        }
+        temperature_started_ = true;
     }
-    temperature_started_ = true;
     return true;
 }
 
 void InfirayNetCamera::stop()
 {
+    std::lock_guard<std::mutex> control_lock(control_mutex_);
     cleanup();
 }
 
 bool InfirayNetCamera::running() const noexcept
 {
-    return preview_started_ && temperature_started_;
+    std::lock_guard<std::mutex> control_lock(control_mutex_);
+    return (preview_enabled_ || temperature_enabled_) &&
+           (!preview_enabled_ || preview_started_) &&
+           (!temperature_enabled_ || temperature_started_);
 }
 
-void InfirayNetCamera::videoCallbackBridge(
-    IRC_NET_HANDLE,
-    char* frame,
-    int width,
-    int height,
-    void* user_data)
+bool InfirayNetCamera::correctShutter(std::string& error)
+{
+    std::lock_guard<std::mutex> control_lock(control_mutex_);
+    error.clear();
+    if (!logged_in_) {
+        error = "camera is not logged in";
+        return false;
+    }
+
+    const int result = IRC_NET_CorrectShutter(handle_);
+    if (result != IRC_NET_ERROR_OK) {
+        error = sdkError("IRC_NET_CorrectShutter", result);
+        return false;
+    }
+    return true;
+}
+
+void InfirayNetCamera::videoCallbackBridge(IRC_NET_HANDLE, char* frame,
+                                           int width, int height,
+                                           void* user_data)
 {
     auto* camera = static_cast<InfirayNetCamera*>(user_data);
     if (camera == nullptr ||
@@ -193,20 +209,16 @@ void InfirayNetCamera::videoCallbackBridge(
     }
 
     try {
-        camera->video_callback_(
-            reinterpret_cast<const std::uint8_t*>(frame),
-            width,
-            height);
+        camera->video_callback_(reinterpret_cast<const std::uint8_t*>(frame),
+                                width, height);
     } catch (...) {
         // C ABI 콜백 경계를 넘어 예외가 전달되지 않게 한다.
     }
 }
 
 void InfirayNetCamera::temperatureCallbackBridge(
-    IRC_NET_HANDLE,
-    IRC_NET_TEMP_INFO_CB* temperature_info,
-    IRC_NET_TEMP_EXT_INFO_CB* extended_info,
-    void* user_data)
+    IRC_NET_HANDLE, IRC_NET_TEMP_INFO_CB* temperature_info,
+    IRC_NET_TEMP_EXT_INFO_CB* extended_info, void* user_data)
 {
     auto* camera = static_cast<InfirayNetCamera*>(user_data);
     if (camera == nullptr ||
@@ -221,9 +233,7 @@ void InfirayNetCamera::temperatureCallbackBridge(
     try {
         camera->temperature_callback_(
             reinterpret_cast<const std::uint16_t*>(temperature_info->temp),
-            temperature_info->width,
-            temperature_info->height,
-            timestamp);
+            temperature_info->width, temperature_info->height, timestamp);
     } catch (...) {
         // C ABI 콜백 경계를 넘어 예외가 전달되지 않게 한다.
     }
@@ -258,6 +268,8 @@ void InfirayNetCamera::cleanup() noexcept
 
     video_callback_ = nullptr;
     temperature_callback_ = nullptr;
+    preview_enabled_ = false;
+    temperature_enabled_ = false;
 }
 
 }  // namespace infiray_ros2
